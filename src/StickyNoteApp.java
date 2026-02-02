@@ -23,7 +23,8 @@ import java.util.List;
 
 public final class StickyNoteApp {
     private enum Theme { SYSTEM, LIGHT, DARK }
-    private enum Scope { ACTIVE, ARCHIVED, ALL }
+    private enum Scope { ACTIVE, ARCHIVED, ALL, TRASH }
+    private enum EditorMode { EDIT, SPLIT, PREVIEW }
 
     private final AppPaths paths = new AppPaths();
     private final AppConfig config = new AppConfig(paths.configFile);
@@ -40,10 +41,17 @@ public final class StickyNoteApp {
     private final JLabel statusLeft = new JLabel(" ");
     private final JLabel statusRight = new JLabel(" ");
     private final Timer autoSaveTimer;
+    private final Timer previewTimer;
     private final UndoManager undoManager = new UndoManager();
 
     private JFrame frame;
     private JSplitPane splitPane;
+    private JTabbedPane editorTabs;
+    private JScrollPane editorScroll;
+    private JScrollPane previewScroll;
+    private JSplitPane splitPreviewPane;
+    private boolean splitPreviewListenerInstalled = false;
+    private boolean suppressEditorTabEvents = false;
     private boolean suppressDocEvents = false;
     private boolean dirty = false;
     private String currentNoteId = null;
@@ -69,6 +77,13 @@ public final class StickyNoteApp {
             }
         });
         autoSaveTimer.setRepeats(false);
+
+        previewTimer = new Timer(250, new ActionListener() {
+            @Override public void actionPerformed(ActionEvent e) {
+                renderPreviewIfVisible();
+            }
+        });
+        previewTimer.setRepeats(false);
     }
 
     private void start() throws IOException {
@@ -125,6 +140,7 @@ public final class StickyNoteApp {
                 onNoteSelected(noteList.getSelectedValue());
             }
         });
+        installListContextMenu();
 
         editor.setLineWrap(true);
         editor.setWrapStyleWord(true);
@@ -140,6 +156,13 @@ public final class StickyNoteApp {
         previewPane.setEditable(false);
         previewPane.setContentType("text/html");
         previewPane.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        previewPane.addHyperlinkListener(e -> {
+            if (e.getEventType() == javax.swing.event.HyperlinkEvent.EventType.ACTIVATED) {
+                try {
+                    if (Desktop.isDesktopSupported()) Desktop.getDesktop().browse(e.getURL().toURI());
+                } catch (Exception ignored) {}
+            }
+        });
 
         searchField.putClientProperty("JTextField.placeholderText", "搜索标题/内容/标签…");
         searchField.addKeyListener(new KeyAdapter() {
@@ -191,21 +214,43 @@ public final class StickyNoteApp {
     }
 
     private JComponent createEditorPanel() {
-        JTabbedPane tabs = new JTabbedPane();
-        JScrollPane editScroll = new JScrollPane(editor);
-        editScroll.setBorder(BorderFactory.createEmptyBorder());
+        editorTabs = new JTabbedPane();
 
-        JScrollPane previewScroll = new JScrollPane(previewPane);
+        editorScroll = new JScrollPane(editor);
+        editorScroll.setBorder(BorderFactory.createEmptyBorder());
+
+        previewScroll = new JScrollPane(previewPane);
         previewScroll.setBorder(BorderFactory.createEmptyBorder());
 
-        tabs.addTab("编辑", editScroll);
-        tabs.addTab("预览", previewScroll);
-        tabs.addChangeListener(e -> {
-            if (tabs.getSelectedIndex() == 1) {
-                markdownPreview.renderTo(previewPane, editor.getText());
-            }
+        JPanel editPanel = new JPanel(new BorderLayout());
+        JPanel splitPanel = new JPanel(new BorderLayout());
+        JPanel previewPanel = new JPanel(new BorderLayout());
+
+        editorTabs.addTab("编辑", editPanel);
+        editorTabs.addTab("分屏", splitPanel);
+        editorTabs.addTab("预览", previewPanel);
+
+        splitPreviewPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
+        splitPreviewPane.setContinuousLayout(true);
+        splitPreviewPane.setDividerSize(10);
+        splitPanel.add(splitPreviewPane, BorderLayout.CENTER);
+        if (!splitPreviewListenerInstalled) {
+            splitPreviewPane.addPropertyChangeListener(JSplitPane.DIVIDER_LOCATION_PROPERTY, evt -> {
+                config.setInt("previewDivider", splitPreviewPane.getDividerLocation());
+                config.save();
+            });
+            splitPreviewListenerInstalled = true;
+        }
+
+        editorTabs.addChangeListener(e -> {
+            if (suppressEditorTabEvents) return;
+            EditorMode mode = editorModeFromTabIndex(editorTabs.getSelectedIndex());
+            applyEditorMode(mode);
         });
-        return tabs;
+
+        EditorMode mode = EditorMode.valueOf(config.getString("editorMode", EditorMode.EDIT.name()));
+        applyEditorMode(mode);
+        return editorTabs;
     }
 
     private JToolBar createToolbar() {
@@ -223,6 +268,8 @@ public final class StickyNoteApp {
         tb.add(button("导出", e -> actionExport()));
         tb.addSeparator();
         tb.add(button("删除", e -> actionDelete()));
+        tb.addSeparator();
+        tb.add(button("回收站", e -> actionShowTrash()));
 
         return tb;
     }
@@ -279,6 +326,8 @@ public final class StickyNoteApp {
         view.add(item("暗色主题", null, e -> actionTheme(Theme.DARK)));
         view.addSeparator();
         view.add(item("聚焦搜索", KeyStroke.getKeyStroke(KeyEvent.VK_F, menuMask()), e -> searchField.requestFocusInWindow()));
+        view.add(item("回收站", KeyStroke.getKeyStroke(KeyEvent.VK_R, menuMask()), e -> actionShowTrash()));
+        view.add(item("清空回收站…", null, e -> actionEmptyTrash()));
 
         JMenu help = new JMenu("帮助");
         help.add(item("关于", null, e -> JOptionPane.showMessageDialog(frame,
@@ -326,6 +375,11 @@ public final class StickyNoteApp {
         am.put("toggleArchived", new AbstractAction() {
             @Override public void actionPerformed(ActionEvent e) { actionToggleArchived(); }
         });
+
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_L, menuMask()), "cycleEditorMode");
+        am.put("cycleEditorMode", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { actionCycleEditorMode(); }
+        });
     }
 
     private void onEditorChanged() {
@@ -334,6 +388,7 @@ public final class StickyNoteApp {
         statusLeft.setText("未保存…");
         updateCounts();
         autoSaveTimer.restart();
+        if (shouldLivePreview()) previewTimer.restart();
     }
 
     private void updateCounts() {
@@ -377,6 +432,9 @@ public final class StickyNoteApp {
             undoManager.discardAllEdits();
             editor.setText(n == null ? "" : safe(n.content));
             editor.setCaretPosition(0);
+            boolean editable = n != null && !n.deleted;
+            editor.setEditable(editable);
+            editor.setEnabled(true);
             currentNoteId = n == null ? null : n.id;
             dirty = false;
             statusLeft.setText("已加载");
@@ -405,6 +463,7 @@ public final class StickyNoteApp {
             dirty = false;
             statusLeft.setText("已保存");
             reloadListOnlyPreserveSelection(currentNoteId);
+            if (shouldLivePreview()) previewTimer.restart();
         } catch (IOException e) {
             statusLeft.setText("保存失败：" + e.getMessage());
         }
@@ -412,15 +471,36 @@ public final class StickyNoteApp {
 
     private void reloadFiltersAndList() {
         Scope scope = (Scope) scopeBox.getSelectedItem();
-        boolean includeArchived = scope == Scope.ALL;
 
         tagBox.removeAllItems();
         tagBox.addItem("（全部标签）");
-        List<String> tags = new ArrayList<String>(store.collectTags(includeArchived));
+        List<String> tags = new ArrayList<String>(collectTagsForScope(scope));
         Collections.sort(tags);
         for (int i = 0; i < tags.size(); i++) tagBox.addItem(tags.get(i));
 
         reloadListOnly();
+    }
+
+    private java.util.Set<String> collectTagsForScope(Scope scope) {
+        java.util.Set<String> tags = new java.util.HashSet<String>();
+        List<Note> all = store.getAll();
+        for (int i = 0; i < all.size(); i++) {
+            Note n = all.get(i);
+            if (n == null) continue;
+            if (scope == Scope.TRASH) {
+                if (!n.deleted) continue;
+            } else {
+                if (n.deleted) continue;
+                if (scope == Scope.ACTIVE && n.archived) continue;
+                if (scope == Scope.ARCHIVED && !n.archived) continue;
+            }
+            if (n.tags == null) continue;
+            for (int t = 0; t < n.tags.size(); t++) {
+                String tag = NoteStore.normalizeTag(n.tags.get(t));
+                if (tag.length() > 0) tags.add(tag);
+            }
+        }
+        return tags;
     }
 
     private void reloadListOnly() {
@@ -433,6 +513,7 @@ public final class StickyNoteApp {
         Scope scope = (Scope) scopeBox.getSelectedItem();
         String q = searchField.getText();
         String tag = selectedTag();
+        noteList.putClientProperty("query", q);
 
         List<Note> all = new ArrayList<Note>(store.getAll());
         Collections.sort(all, new Comparator<Note>() {
@@ -445,14 +526,20 @@ public final class StickyNoteApp {
 
         for (int i = 0; i < all.size(); i++) {
             Note n = all.get(i);
-            if (scope == Scope.ACTIVE && n.archived) continue;
-            if (scope == Scope.ARCHIVED && !n.archived) continue;
+            if (scope == Scope.TRASH) {
+                if (!n.deleted) continue;
+            } else {
+                if (n.deleted) continue;
+                if (scope == Scope.ACTIVE && n.archived) continue;
+                if (scope == Scope.ARCHIVED && !n.archived) continue;
+            }
             if (!n.matchesQuery(q)) continue;
             if (tag != null && tag.length() > 0 && !hasTag(n, tag)) continue;
             listModel.addElement(n);
         }
 
         selectByIdOrFirst(keepId);
+        noteList.repaint();
     }
 
     private void selectByIdOrFirst(String id) {
@@ -502,10 +589,24 @@ public final class StickyNoteApp {
     private void actionDelete() {
         Note n = selectedNote();
         if (n == null) return;
-        int ok = JOptionPane.showConfirmDialog(frame, "确定要删除这条便签吗？", "确认删除", JOptionPane.OK_CANCEL_OPTION);
+        if (n.deleted) {
+            int ok = JOptionPane.showConfirmDialog(frame, "确定要永久删除这条便签吗？（不可恢复）", "永久删除", JOptionPane.OK_CANCEL_OPTION);
+            if (ok != JOptionPane.OK_OPTION) return;
+            try {
+                store.deletePermanently(n.id);
+                currentNoteId = null;
+                dirty = false;
+                reloadFiltersAndList();
+            } catch (IOException e) {
+                JOptionPane.showMessageDialog(frame, e.toString(), "删除失败", JOptionPane.ERROR_MESSAGE);
+            }
+            return;
+        }
+
+        int ok = JOptionPane.showConfirmDialog(frame, "确定要将这条便签移入回收站吗？", "移入回收站", JOptionPane.OK_CANCEL_OPTION);
         if (ok != JOptionPane.OK_OPTION) return;
         try {
-            store.deleteNote(n.id);
+            store.moveToTrash(n.id);
             currentNoteId = null;
             dirty = false;
             reloadFiltersAndList();
@@ -517,6 +618,7 @@ public final class StickyNoteApp {
     private void actionTogglePinned() {
         Note n = selectedNote();
         if (n == null) return;
+        if (n.deleted) return;
         n.pinned = !n.pinned;
         try {
             store.updateNote(n, false);
@@ -529,6 +631,7 @@ public final class StickyNoteApp {
     private void actionToggleArchived() {
         Note n = selectedNote();
         if (n == null) return;
+        if (n.deleted) return;
         n.archived = !n.archived;
         try {
             store.updateNote(n, false);
@@ -542,6 +645,7 @@ public final class StickyNoteApp {
     private void actionEditTags() {
         Note n = selectedNote();
         if (n == null) return;
+        if (n.deleted) return;
         String before = n.tagsJoined();
         String input = (String) JOptionPane.showInputDialog(frame, "输入标签（逗号分隔）", "编辑标签",
                 JOptionPane.PLAIN_MESSAGE, null, null, before);
@@ -561,6 +665,36 @@ public final class StickyNoteApp {
             selectByIdOrFirst(n.id);
         } catch (IOException e) {
             statusLeft.setText("操作失败：" + e.getMessage());
+        }
+    }
+
+    private void actionShowTrash() {
+        scopeBox.setSelectedItem(Scope.TRASH);
+        reloadFiltersAndList();
+    }
+
+    private void actionRestoreSelected() {
+        Note n = selectedNote();
+        if (n == null || !n.deleted) return;
+        try {
+            store.restoreFromTrash(n.id);
+            reloadFiltersAndList();
+            selectByIdOrFirst(n.id);
+        } catch (IOException e) {
+            statusLeft.setText("操作失败：" + e.getMessage());
+        }
+    }
+
+    private void actionEmptyTrash() {
+        int ok = JOptionPane.showConfirmDialog(frame, "确定要清空回收站吗？（不可恢复）", "清空回收站", JOptionPane.OK_CANCEL_OPTION);
+        if (ok != JOptionPane.OK_OPTION) return;
+        try {
+            store.emptyTrash();
+            currentNoteId = null;
+            dirty = false;
+            reloadFiltersAndList();
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(frame, e.toString(), "清空失败", JOptionPane.ERROR_MESSAGE);
         }
     }
 
@@ -683,6 +817,110 @@ public final class StickyNoteApp {
         String text = editor.getText();
         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text == null ? "" : text), null);
         statusLeft.setText("已复制到剪贴板");
+    }
+
+    private void renderPreviewIfVisible() {
+        if (editorTabs == null) return;
+        if (!shouldLivePreview()) return;
+        markdownPreview.renderTo(previewPane, editor.getText());
+    }
+
+    private boolean shouldLivePreview() {
+        if (editorTabs == null) return false;
+        EditorMode mode = editorModeFromTabIndex(editorTabs.getSelectedIndex());
+        return mode == EditorMode.SPLIT || mode == EditorMode.PREVIEW;
+    }
+
+    private void actionCycleEditorMode() {
+        if (editorTabs == null) return;
+        int idx = editorTabs.getSelectedIndex();
+        int next = (idx + 1) % editorTabs.getTabCount();
+        editorTabs.setSelectedIndex(next);
+    }
+
+    private void applyEditorMode(EditorMode mode) {
+        if (editorTabs == null) return;
+        suppressEditorTabEvents = true;
+        try {
+            editorTabs.setSelectedIndex(tabIndexFromEditorMode(mode));
+        } finally {
+            suppressEditorTabEvents = false;
+        }
+        config.setString("editorMode", mode.name());
+        config.save();
+
+        JPanel editPanel = (JPanel) editorTabs.getComponentAt(0);
+        JPanel splitPanel = (JPanel) editorTabs.getComponentAt(1);
+        JPanel previewPanel = (JPanel) editorTabs.getComponentAt(2);
+
+        editPanel.removeAll();
+        previewPanel.removeAll();
+        splitPreviewPane.setLeftComponent(null);
+        splitPreviewPane.setRightComponent(null);
+
+        if (mode == EditorMode.EDIT) {
+            editPanel.add(editorScroll, BorderLayout.CENTER);
+        } else if (mode == EditorMode.PREVIEW) {
+            previewPanel.add(previewScroll, BorderLayout.CENTER);
+        } else {
+            splitPreviewPane.setLeftComponent(editorScroll);
+            splitPreviewPane.setRightComponent(previewScroll);
+            int div = config.getInt("previewDivider", -1);
+            if (div > 0) splitPreviewPane.setDividerLocation(div);
+        }
+
+        editorTabs.revalidate();
+        editorTabs.repaint();
+
+        if (mode == EditorMode.SPLIT || mode == EditorMode.PREVIEW) previewTimer.restart();
+        else focusEditor();
+    }
+
+    private static EditorMode editorModeFromTabIndex(int idx) {
+        if (idx == 1) return EditorMode.SPLIT;
+        if (idx == 2) return EditorMode.PREVIEW;
+        return EditorMode.EDIT;
+    }
+
+    private static int tabIndexFromEditorMode(EditorMode mode) {
+        if (mode == EditorMode.SPLIT) return 1;
+        if (mode == EditorMode.PREVIEW) return 2;
+        return 0;
+    }
+
+    private void installListContextMenu() {
+        final JPopupMenu menu = new JPopupMenu();
+        JMenuItem restore = item("从回收站还原", null, e -> actionRestoreSelected());
+        JMenuItem del = item("删除", null, e -> actionDelete());
+        JMenuItem pin = item("置顶/取消置顶", null, e -> actionTogglePinned());
+        JMenuItem arch = item("归档/取消归档", null, e -> actionToggleArchived());
+        JMenuItem tags = item("编辑标签…", null, e -> actionEditTags());
+
+        menu.add(restore);
+        menu.addSeparator();
+        menu.add(pin);
+        menu.add(arch);
+        menu.add(tags);
+        menu.addSeparator();
+        menu.add(del);
+
+        noteList.addMouseListener(new MouseAdapter() {
+            private void showIfPopup(MouseEvent e) {
+                if (!e.isPopupTrigger()) return;
+                int idx = noteList.locationToIndex(e.getPoint());
+                if (idx >= 0) noteList.setSelectedIndex(idx);
+                Note n = noteList.getSelectedValue();
+                boolean isTrash = n != null && n.deleted;
+                restore.setVisible(isTrash);
+                pin.setEnabled(!isTrash);
+                arch.setEnabled(!isTrash);
+                tags.setEnabled(!isTrash);
+                menu.show(noteList, e.getX(), e.getY());
+            }
+
+            @Override public void mousePressed(MouseEvent e) { showIfPopup(e); }
+            @Override public void mouseReleased(MouseEvent e) { showIfPopup(e); }
+        });
     }
 
     private Note selectedNote() {

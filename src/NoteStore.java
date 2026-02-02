@@ -75,7 +75,28 @@ public final class NoteStore {
         return n;
     }
 
-    public void deleteNote(String id) throws IOException {
+    public void moveToTrash(String id) throws IOException {
+        if (id == null) return;
+        Note n = getById(id);
+        if (n != null && !n.deleted) {
+            n.deleted = true;
+            n.deletedAt = System.currentTimeMillis();
+        }
+        saveAll();
+    }
+
+    public void restoreFromTrash(String id) throws IOException {
+        if (id == null) return;
+        Note n = getById(id);
+        if (n != null && n.deleted) {
+            n.deleted = false;
+            n.deletedAt = 0L;
+            n.updatedAt = System.currentTimeMillis();
+        }
+        saveAll();
+    }
+
+    public void deletePermanently(String id) throws IOException {
         if (id == null) return;
         for (int i = 0; i < notes.size(); i++) {
             if (id.equals(notes.get(i).id)) {
@@ -87,17 +108,31 @@ public final class NoteStore {
         saveAll();
     }
 
+    public void emptyTrash() throws IOException {
+        for (int i = notes.size() - 1; i >= 0; i--) {
+            Note n = notes.get(i);
+            if (n != null && n.deleted) notes.remove(i);
+        }
+        if (notes.isEmpty()) notes.add(Note.createEmpty());
+        saveAll();
+    }
+
     public void updateNote(Note note, boolean writeHistory) throws IOException {
         if (note == null) return;
+        if (note.deleted) {
+            saveAll();
+            return;
+        }
         note.updatedAt = System.currentTimeMillis();
         if (writeHistory) writeHistorySnapshot(note);
         saveAll();
     }
 
-    public Set<String> collectTags(boolean includeArchived) {
+    public Set<String> collectTags(boolean includeArchived, boolean includeDeleted) {
         Set<String> tags = new HashSet<String>();
         for (int i = 0; i < notes.size(); i++) {
             Note n = notes.get(i);
+            if (!includeDeleted && n.deleted) continue;
             if (!includeArchived && n.archived) continue;
             if (n.tags == null) continue;
             for (int t = 0; t < n.tags.size(); t++) {
@@ -155,6 +190,7 @@ public final class NoteStore {
                     Note n = arr[i];
                     if (n == null || n.id == null) continue;
                     if (n.tags == null) n.tags = new ArrayList<String>();
+                    if (n.deletedAt < 0L) n.deletedAt = 0L;
                     notes.add(n);
                 }
             }

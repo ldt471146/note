@@ -9,6 +9,8 @@ public final class Note {
     public List<String> tags;
     public boolean pinned;
     public boolean archived;
+    public boolean deleted;
+    public long deletedAt;
     public long createdAt;
     public long updatedAt;
 
@@ -21,6 +23,8 @@ public final class Note {
         n.tags = new ArrayList<String>();
         n.pinned = false;
         n.archived = false;
+        n.deleted = false;
+        n.deletedAt = 0L;
         long now = System.currentTimeMillis();
         n.createdAt = now;
         n.updatedAt = now;
@@ -45,8 +49,9 @@ public final class Note {
         if (q == null) return true;
         q = q.trim();
         if (q.length() == 0) return true;
-        String hay = (title() + "\n" + snippet() + "\n" + tagsJoined()).toLowerCase(Locale.ROOT);
-        return hay.contains(q.toLowerCase(Locale.ROOT));
+        String needle = q.toLowerCase(Locale.ROOT);
+        String hay = (title() + "\n" + tagsJoined() + "\n" + (content == null ? "" : content)).toLowerCase(Locale.ROOT);
+        return hay.contains(needle);
     }
 
     public String tagsJoined() {
