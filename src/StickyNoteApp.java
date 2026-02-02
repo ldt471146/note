@@ -13,13 +13,19 @@ import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.*;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
 
 public final class StickyNoteApp {
     private enum Theme { SYSTEM, LIGHT, DARK }
@@ -42,6 +48,7 @@ public final class StickyNoteApp {
     private final JLabel statusRight = new JLabel(" ");
     private final Timer autoSaveTimer;
     private final Timer previewTimer;
+    private final Timer searchTimer;
     private final UndoManager undoManager = new UndoManager();
 
     private JFrame frame;
@@ -51,6 +58,9 @@ public final class StickyNoteApp {
     private JScrollPane previewScroll;
     private JSplitPane splitPreviewPane;
     private boolean splitPreviewListenerInstalled = false;
+    private JPanel editorWrapper;
+    private JPanel tagChipsPanel;
+    private JButton addTagButton;
     private boolean suppressEditorTabEvents = false;
     private boolean suppressDocEvents = false;
     private boolean dirty = false;
@@ -84,6 +94,13 @@ public final class StickyNoteApp {
             }
         });
         previewTimer.setRepeats(false);
+
+        searchTimer = new Timer(120, new ActionListener() {
+            @Override public void actionPerformed(ActionEvent e) {
+                reloadListOnly();
+            }
+        });
+        searchTimer.setRepeats(false);
     }
 
     private void start() throws IOException {
@@ -165,10 +182,10 @@ public final class StickyNoteApp {
         });
 
         searchField.putClientProperty("JTextField.placeholderText", "搜索标题/内容/标签…");
-        searchField.addKeyListener(new KeyAdapter() {
-            @Override public void keyReleased(KeyEvent e) {
-                reloadListOnly();
-            }
+        searchField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e) { searchTimer.restart(); }
+            @Override public void removeUpdate(DocumentEvent e) { searchTimer.restart(); }
+            @Override public void changedUpdate(DocumentEvent e) { searchTimer.restart(); }
         });
 
         scopeBox.setSelectedItem(Scope.ACTIVE);
@@ -216,8 +233,15 @@ public final class StickyNoteApp {
     private JComponent createEditorPanel() {
         editorTabs = new JTabbedPane();
 
+        editorWrapper = new JPanel(new BorderLayout());
+        tagChipsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 6));
+        tagChipsPanel.setOpaque(false);
+        tagChipsPanel.setBorder(BorderFactory.createEmptyBorder(6, 10, 4, 10));
+        editorWrapper.add(tagChipsPanel, BorderLayout.NORTH);
+
         editorScroll = new JScrollPane(editor);
         editorScroll.setBorder(BorderFactory.createEmptyBorder());
+        editorWrapper.add(editorScroll, BorderLayout.CENTER);
 
         previewScroll = new JScrollPane(previewPane);
         previewScroll.setBorder(BorderFactory.createEmptyBorder());
@@ -298,6 +322,9 @@ public final class StickyNoteApp {
         file.add(item("新建", KeyStroke.getKeyStroke(KeyEvent.VK_N, menuMask()), e -> actionNew()));
         file.add(item("导入…", KeyStroke.getKeyStroke(KeyEvent.VK_I, menuMask()), e -> actionImport()));
         file.add(item("导出…", KeyStroke.getKeyStroke(KeyEvent.VK_E, menuMask()), e -> actionExport()));
+        file.addSeparator();
+        file.add(item("备份导出…", null, e -> actionBackupExport()));
+        file.add(item("备份导入…", null, e -> actionBackupImport()));
         file.addSeparator();
         file.add(item("打开数据目录", null, e -> actionOpenDataDir()));
         file.addSeparator();
@@ -439,6 +466,7 @@ public final class StickyNoteApp {
             dirty = false;
             statusLeft.setText("已加载");
             updateCounts();
+            rebuildTagChips(n);
         } finally {
             suppressDocEvents = false;
         }
@@ -663,6 +691,7 @@ public final class StickyNoteApp {
             store.updateNote(n, false);
             reloadFiltersAndList();
             selectByIdOrFirst(n.id);
+            rebuildTagChips(n);
         } catch (IOException e) {
             statusLeft.setText("操作失败：" + e.getMessage());
         }
@@ -807,6 +836,163 @@ public final class StickyNoteApp {
         }
     }
 
+    private void actionBackupExport() {
+        saveIfDirty(false);
+        JFileChooser fc = new JFileChooser();
+        fc.setSelectedFile(new java.io.File("sticky-note-backup.zip"));
+        int ok = fc.showSaveDialog(frame);
+        if (ok != JFileChooser.APPROVE_OPTION) return;
+        Path file = fc.getSelectedFile().toPath();
+        try {
+            writeBackupZip(file);
+            statusLeft.setText("已备份导出：" + file.getFileName());
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(frame, e.toString(), "备份导出失败", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void actionBackupImport() {
+        saveIfDirty(false);
+        JFileChooser fc = new JFileChooser();
+        int ok = fc.showOpenDialog(frame);
+        if (ok != JFileChooser.APPROVE_OPTION) return;
+        Path file = fc.getSelectedFile().toPath();
+
+        int sure = JOptionPane.showConfirmDialog(frame,
+                "导入备份会覆盖当前数据（notes.json），确定继续吗？",
+                "确认导入备份",
+                JOptionPane.OK_CANCEL_OPTION);
+        if (sure != JOptionPane.OK_OPTION) return;
+
+        try {
+            readBackupZip(file);
+            store.ensureLoaded();
+            reloadFiltersAndList();
+            selectByIdOrFirst(currentNoteId);
+            statusLeft.setText("已导入备份：" + file.getFileName());
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(frame, e.toString(), "备份导入失败", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void writeBackupZip(Path zipFile) throws IOException {
+        Files.createDirectories(zipFile.toAbsolutePath().getParent());
+        try (OutputStream out = Files.newOutputStream(zipFile, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+             ZipOutputStream zos = new ZipOutputStream(out)) {
+            if (Files.exists(paths.notesFile)) addZipFile(zos, "notes.json", paths.notesFile);
+            if (Files.exists(paths.configFile)) addZipFile(zos, "config.properties", paths.configFile);
+            if (Files.isDirectory(paths.historyDir)) addZipDir(zos, "history/", paths.historyDir);
+        }
+    }
+
+    private void readBackupZip(Path zipFile) throws IOException {
+        if (!Files.exists(zipFile)) throw new IOException("File not found: " + zipFile);
+        Files.createDirectories(paths.appDir);
+        Files.createDirectories(paths.historyDir);
+
+        Path tmp = paths.appDir.resolve("import_tmp");
+        if (Files.exists(tmp)) deleteRecursively(tmp);
+        Files.createDirectories(tmp);
+
+        try (InputStream in = Files.newInputStream(zipFile);
+             ZipInputStream zis = new ZipInputStream(in)) {
+            ZipEntry e;
+            while ((e = zis.getNextEntry()) != null) {
+                if (e.isDirectory()) continue;
+                String name = e.getName();
+                if (name == null) continue;
+                if (name.startsWith("/") || name.contains("..") || name.contains(":")) continue;
+                Path out = tmp.resolve(name.replace("/", java.io.File.separator));
+                Files.createDirectories(out.getParent());
+                Files.copy(zis, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+
+        Path notes = tmp.resolve("notes.json");
+        Path cfg = tmp.resolve("config.properties");
+        if (Files.exists(notes)) Files.copy(notes, paths.notesFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        if (Files.exists(cfg)) Files.copy(cfg, paths.configFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+        Path hist = tmp.resolve("history");
+        if (Files.isDirectory(hist)) {
+            if (Files.exists(paths.historyDir)) deleteRecursively(paths.historyDir);
+            Files.createDirectories(paths.historyDir);
+            copyRecursively(hist, paths.historyDir);
+        }
+
+        deleteRecursively(tmp);
+    }
+
+    private static void addZipFile(ZipOutputStream zos, String entryName, Path file) throws IOException {
+        ZipEntry e = new ZipEntry(entryName);
+        zos.putNextEntry(e);
+        byte[] buf = new byte[8192];
+        try (InputStream in = Files.newInputStream(file)) {
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                if (n == 0) continue;
+                zos.write(buf, 0, n);
+            }
+        }
+        zos.closeEntry();
+    }
+
+    private static void addZipDir(ZipOutputStream zos, String prefix, Path dir) throws IOException {
+        java.util.ArrayDeque<Path> stack = new java.util.ArrayDeque<Path>();
+        stack.push(dir);
+        while (!stack.isEmpty()) {
+            Path cur = stack.pop();
+            try (java.nio.file.DirectoryStream<Path> ds = Files.newDirectoryStream(cur)) {
+                for (Path p : ds) {
+                    if (Files.isDirectory(p)) stack.push(p);
+                    else {
+                        Path rel = dir.relativize(p);
+                        String name = prefix + rel.toString().replace(java.io.File.separatorChar, '/');
+                        addZipFile(zos, name, p);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void copyRecursively(Path from, Path to) throws IOException {
+        java.util.ArrayDeque<Path> stack = new java.util.ArrayDeque<Path>();
+        stack.push(from);
+        while (!stack.isEmpty()) {
+            Path cur = stack.pop();
+            Path rel = from.relativize(cur);
+            Path dst = to.resolve(rel.toString());
+            if (Files.isDirectory(cur)) {
+                Files.createDirectories(dst);
+                try (java.nio.file.DirectoryStream<Path> ds = Files.newDirectoryStream(cur)) {
+                    for (Path p : ds) stack.push(p);
+                }
+            } else {
+                Files.createDirectories(dst.getParent());
+                Files.copy(cur, dst, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private static void deleteRecursively(Path p) throws IOException {
+        if (!Files.exists(p)) return;
+        java.util.ArrayDeque<Path> stack = new java.util.ArrayDeque<Path>();
+        java.util.ArrayList<Path> all = new java.util.ArrayList<Path>();
+        stack.push(p);
+        while (!stack.isEmpty()) {
+            Path cur = stack.pop();
+            all.add(cur);
+            if (Files.isDirectory(cur)) {
+                try (java.nio.file.DirectoryStream<Path> ds = Files.newDirectoryStream(cur)) {
+                    for (Path c : ds) stack.push(c);
+                }
+            }
+        }
+        for (int i = all.size() - 1; i >= 0; i--) {
+            try { Files.deleteIfExists(all.get(i)); } catch (IOException ignored) {}
+        }
+    }
+
     private void actionOpenDataDir() {
         try {
             if (Desktop.isDesktopSupported()) Desktop.getDesktop().open(paths.appDir.toFile());
@@ -859,11 +1045,11 @@ public final class StickyNoteApp {
         splitPreviewPane.setRightComponent(null);
 
         if (mode == EditorMode.EDIT) {
-            editPanel.add(editorScroll, BorderLayout.CENTER);
+            editPanel.add(editorWrapper, BorderLayout.CENTER);
         } else if (mode == EditorMode.PREVIEW) {
             previewPanel.add(previewScroll, BorderLayout.CENTER);
         } else {
-            splitPreviewPane.setLeftComponent(editorScroll);
+            splitPreviewPane.setLeftComponent(editorWrapper);
             splitPreviewPane.setRightComponent(previewScroll);
             int div = config.getInt("previewDivider", -1);
             if (div > 0) splitPreviewPane.setDividerLocation(div);
@@ -886,6 +1072,76 @@ public final class StickyNoteApp {
         if (mode == EditorMode.SPLIT) return 1;
         if (mode == EditorMode.PREVIEW) return 2;
         return 0;
+    }
+
+    private void rebuildTagChips(Note note) {
+        if (tagChipsPanel == null) return;
+        tagChipsPanel.removeAll();
+
+        addTagButton = new JButton("＋ 标签");
+        addTagButton.setFocusable(false);
+        addTagButton.addActionListener(e -> actionQuickAddTag());
+
+        boolean editable = note != null && !note.deleted;
+        addTagButton.setEnabled(editable);
+
+        if (note != null && note.tags != null && !note.tags.isEmpty()) {
+            for (int i = 0; i < note.tags.size(); i++) {
+                final String tag = NoteStore.normalizeTag(note.tags.get(i));
+                if (tag.length() == 0) continue;
+                JButton chip = new JButton("#" + tag + "  ×");
+                chip.setFocusable(false);
+                chip.setEnabled(editable);
+                chip.addActionListener(e -> actionRemoveTag(tag));
+                tagChipsPanel.add(chip);
+            }
+            tagChipsPanel.add(Box.createHorizontalStrut(6));
+        }
+
+        tagChipsPanel.add(addTagButton);
+        tagChipsPanel.revalidate();
+        tagChipsPanel.repaint();
+    }
+
+    private void actionQuickAddTag() {
+        Note n = selectedNote();
+        if (n == null || n.deleted) return;
+        String input = JOptionPane.showInputDialog(frame, "输入一个标签（不需要 #）", "添加标签", JOptionPane.PLAIN_MESSAGE);
+        if (input == null) return;
+        String t = NoteStore.normalizeTag(input);
+        if (t.length() == 0) return;
+        if (n.tags == null) n.tags = new ArrayList<String>();
+        if (!containsIgnoreCase(n.tags, t)) n.tags.add(t);
+        try {
+            store.updateNote(n, false);
+            reloadFiltersAndList();
+            selectByIdOrFirst(n.id);
+            rebuildTagChips(n);
+        } catch (IOException e) {
+            statusLeft.setText("操作失败：" + e.getMessage());
+        }
+    }
+
+    private void actionRemoveTag(String tag) {
+        Note n = selectedNote();
+        if (n == null || n.deleted) return;
+        if (n.tags == null || n.tags.isEmpty()) return;
+        boolean changed = false;
+        for (int i = n.tags.size() - 1; i >= 0; i--) {
+            if (tag.equalsIgnoreCase(n.tags.get(i))) {
+                n.tags.remove(i);
+                changed = true;
+            }
+        }
+        if (!changed) return;
+        try {
+            store.updateNote(n, false);
+            reloadFiltersAndList();
+            selectByIdOrFirst(n.id);
+            rebuildTagChips(n);
+        } catch (IOException e) {
+            statusLeft.setText("操作失败：" + e.getMessage());
+        }
     }
 
     private void installListContextMenu() {
